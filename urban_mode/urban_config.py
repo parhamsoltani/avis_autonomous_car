@@ -1,0 +1,19 @@
+# Urban mode configuration
+BASE_SPEED = 50
+MAX_SPEED = 60
+MIN_SPEED = 20
+CROSSWALK_SPEED = 0
+
+# Steering parameters
+STEERING_P_GAIN = 0.6
+STEERING_D_GAIN = 0.2
+MAX_STEERING = 25
+
+# Detection thresholds
+CROSSWALK_CONFIDENCE = 0.7
+SIGN_CONFIDENCE = 0.7
+APRILTAG_CONFIDENCE = 30
+
+# Timing
+CROSSWALK_WAIT_TIME = 4.0  # seconds
+TURN_DURATION = 2.0  # seconds
