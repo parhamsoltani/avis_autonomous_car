@@ -1,7 +1,7 @@
 # AVIS Autonomous Car Simulator
 
 ```bash
-python test_enhancements.py
+python test.py
 
 # Race mode
 cd race_mode
