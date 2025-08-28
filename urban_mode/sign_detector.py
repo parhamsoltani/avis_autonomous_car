@@ -6,6 +6,7 @@ class TrafficSignDetector:
     def __init__(self, show_visualization=False):
         self.show_visualization = show_visualization
         self.initialized = False
+        self.model = None
         
         # Sign mapping for simulator
         self.class_mapping = {
@@ -20,8 +21,31 @@ class TrafficSignDetector:
         # Reverse mapping for display
         self.class_names = {v: k for k, v in self.class_mapping.items()}
         
-        if self._check_yolo_files():
+        # Try to load the enhanced model first
+        self._try_load_enhanced_model()
+        
+        if not self.model and self._check_yolo_files():
             self._init_yolo()
+    
+    def _try_load_enhanced_model(self):
+        """Try to load the best_model.h5 from reference project"""
+        try:
+            import tensorflow as tf
+            from tensorflow import keras
+            
+            # Look for best_model.h5 in urban_mode directory
+            model_path = os.path.join(os.path.dirname(__file__), 'best_model.h5')
+            
+            if os.path.exists(model_path):
+                self.model = keras.models.load_model(model_path)
+                self.model_type = 'enhanced'
+                self.sign_types = ['left', 'straight', 'right']
+                print("Loaded enhanced sign detection model (best_model.h5)")
+            else:
+                print("best_model.h5 not found, will use YOLO instead")
+        except Exception as e:
+            print(f"Could not load enhanced model: {e}")
+            self.model = None
     
     def _check_yolo_files(self):
         """Check if YOLO files exist"""
@@ -43,21 +67,11 @@ class TrafficSignDetector:
             self.net = cv2.dnn.readNet(weights_path, config_path)
             
             # Try CUDA first, fall back to CPU if not available
-            cuda_available = False
             try:
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                # Test CUDA with a dummy forward pass
-                test_blob = cv2.dnn.blobFromImage(np.zeros((416, 416, 3), dtype=np.uint8), 1/255.0, (416, 416))
-                self.net.setInput(test_blob)
-                self.net.forward()
-                cuda_available = True
                 print("Using CUDA for sign detection")
-            except Exception as e:
-                print(f"CUDA failed for sign detection: {e}")
-                cuda_available = False
-            
-            if not cuda_available:
+            except:
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
                 print("Using CPU for sign detection")
@@ -68,19 +82,67 @@ class TrafficSignDetector:
             
             self.confidence_threshold = 0.5
             self.initialized = True
+            self.model_type = 'yolo'
             print("YOLO sign detector initialized")
             
         except Exception as e:
             print(f"Failed to initialize YOLO for signs: {e}")
             self.initialized = False
-
+    
+    def detect_with_enhanced_model(self, frame):
+        """Detect signs using the enhanced model (best_model.h5)"""
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Use color mask to find blue sign regions
+        mask = cv2.inRange(hsv_frame, np.array([100, 160, 90]), np.array([160, 220, 220]))
+        mask[:30, :] = 0  # Remove top portion
+        
+        try:
+            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None
             
+            sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+            
+            if cv2.contourArea(sorted_contours[0]) > 30:
+                x, y, w, h = cv2.boundingRect(sorted_contours[0])
+                
+                # Validate bounding box
+                if 5 < x < 251 and 5 < y < 251 and x + w < 251 and y + h < 251:
+                    sign = frame[y:y+h, x:x+w]
+                    sign_resized = cv2.resize(sign, (25, 25)) / 255.0
+                    
+                    # Predict using model
+                    prediction = self.model.predict(sign_resized.reshape(1, 25, 25, 3), verbose=0)
+                    sign_idx = np.argmax(prediction)
+                    confidence = prediction[0][sign_idx]
+                    
+                    if confidence > 0.7:  # Confidence threshold
+                        sign_type = self.sign_types[sign_idx]
+                        
+                        # Map to number
+                        if sign_type == 'left':
+                            sign_number = 4  # turn-left
+                        elif sign_type == 'right':
+                            sign_number = 5  # turn-right
+                        elif sign_type == 'straight':
+                            sign_number = 3  # Straight Ahead Only
+                        else:
+                            sign_number = None
+                        
+                        if self.show_visualization:
+                            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 255), 2)
+                            cv2.putText(frame, f"{sign_type}: {confidence:.2f}", (x, y-5),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                        
+                        return sign_number
+        except Exception as e:
+            print(f"Error in enhanced sign detection: {e}")
+        
+        return None
     
     def determine_arrow_direction(self, cropped_img):
-        """
-        Determine arrow direction in sign
-        Returns: "turn-left" or "turn-right"
-        """
+        """Determine arrow direction in sign"""
         if cropped_img is None or cropped_img.size == 0:
             return "turn-right"
         
@@ -106,35 +168,24 @@ class TrafficSignDetector:
         # More pixels on left means arrow points right, and vice versa
         direction = "turn-right" if left_pixels > right_pixels else "turn-left"
         
-        if self.show_visualization:
-            debug_img = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-            cv2.line(debug_img, (mid, 0), (mid, height), (0, 255, 0), 1)
-            cv2.putText(debug_img, f"L: {left_pixels}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(debug_img, f"R: {right_pixels}", (mid + 10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(debug_img, direction, (width//4, height-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-            cv2.imshow("Arrow Analysis", debug_img)
-        
         return direction
     
     def detect(self, frame):
-        """
-        Detect traffic signs in frame
-        Returns: sign_number (0-5) or None if no sign detected
-        """
-        if not self.initialized:
-            return None
-        
+        """Main detection method - uses enhanced model if available, else YOLO"""
         if frame is None or frame.size == 0:
             return None
         
-        # Create blob from image
+        # Use enhanced model if available
+        if self.model is not None and hasattr(self, 'model_type') and self.model_type == 'enhanced':
+            return self.detect_with_enhanced_model(frame)
+        
+        # Otherwise use YOLO
+        if not self.initialized:
+            return None
+        
+        # YOLO detection code (existing)
         blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
         self.net.setInput(blob)
-        
-        # Run forward pass
         outs = self.net.forward(self.net.getUnconnectedOutLayersNames())
         
         detected_signs = []
@@ -177,7 +228,6 @@ class TrafficSignDetector:
                     
                     # For turn signs, determine actual direction
                     if class_id in [4, 5] or "turn" in class_name.lower():
-                        # Crop the sign region
                         x_safe = max(0, x)
                         y_safe = max(0, y)
                         x2_safe = min(frame.shape[1], x + w)
@@ -213,10 +263,7 @@ class TrafficSignDetector:
         return None
     
     def get_sign_action(self, sign_number):
-        """
-        Convert sign number to action
-        Returns: -1 for left, 0 for straight/stop, 1 for right
-        """
+        """Convert sign number to action"""
         if sign_number is None:
             return 0
         

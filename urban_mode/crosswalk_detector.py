@@ -5,12 +5,7 @@ from collections import deque
 
 class CrosswalkDetector:
     def __init__(self, use_yolo=True, show_visualization=False):
-        """
-        Initialize crosswalk detector
-        Args:
-            use_yolo: If True, use YOLO model. If False, use classical CV approach
-            show_visualization: Show detection visualization
-        """
+        """Initialize crosswalk detector with enhanced horizontal line detection"""
         self.show_visualization = show_visualization
         self.use_yolo = use_yolo
         self.detection_history = deque(maxlen=5)
@@ -19,7 +14,7 @@ class CrosswalkDetector:
             self._init_yolo()
         else:
             self.use_yolo = False
-            print("Using classical crosswalk detection")
+            print("Using enhanced classical crosswalk detection with horizontal lines")
     
     def _check_yolo_files(self):
         """Check if YOLO files exist"""
@@ -28,7 +23,6 @@ class CrosswalkDetector:
         config_path = os.path.join(base_path, 'yolov4_tiny_traffic_sign_crosswalk', 'yolov4-tiny.cfg')
         
         return os.path.exists(weights_path) and os.path.exists(config_path)
-    
     
     def _init_yolo(self):
         """Initialize YOLO model for crosswalk detection"""
@@ -39,22 +33,12 @@ class CrosswalkDetector:
             
             self.net = cv2.dnn.readNet(weights_path, config_path)
             
-            # Try CUDA first, fall back to CPU if not available
-            cuda_available = False
+            # Try CUDA first, fall back to CPU
             try:
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                # Test CUDA with a dummy forward pass
-                test_blob = cv2.dnn.blobFromImage(np.zeros((320, 320, 3), dtype=np.uint8), 1/255.0, (320, 320))
-                self.net.setInput(test_blob)
-                self.net.forward()
-                cuda_available = True
                 print("Using CUDA for crosswalk detection")
-            except Exception as e:
-                print(f"CUDA failed for crosswalk detection: {e}")
-                cuda_available = False
-            
-            if not cuda_available:
+            except:
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
                 print("Using CPU for crosswalk detection")
@@ -67,27 +51,78 @@ class CrosswalkDetector:
             print(f"Failed to initialize YOLO: {e}")
             self.use_yolo = False
     
-    def detect_classical(self, frame):
-        """Classical computer vision approach for crosswalk detection"""
+    def detect_horizontal_lines(self, mask):
+        """Enhanced horizontal line detection for crosswalks"""
+        # Focus on the region where crosswalks appear
+        roi = mask[160:180, 96:160]
+        
+        try:
+            # Detect lines using Hough transform
+            lines = cv2.HoughLinesP(roi, 1, np.pi/180, threshold=10,
+                                   minLineLength=8, maxLineGap=4)
+            
+            if lines is None:
+                return False
+            
+            # Check for horizontal lines
+            horizontal_count = 0
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                
+                # Calculate angle of line
+                if x2 - x1 != 0:
+                    slope = abs((y2 - y1) / (x2 - x1))
+                    # Line is horizontal if slope is close to 0
+                    if slope < 0.2:
+                        horizontal_count += 1
+            
+            # Crosswalk detected if we have multiple horizontal lines
+            return horizontal_count >= 1
+            
+        except Exception as e:
+            return False
+    
+    def detect_classical_enhanced(self, frame):
+        """Enhanced classical computer vision approach for crosswalk detection"""
         height, width = frame.shape[:2]
         
-        # Focus on bottom half of frame where crosswalks appear
-        roi = frame[height//2:, :]
-        
         # Convert to grayscale
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Apply Gaussian blur
+        # Create white mask for detecting white lines
+        white_mask = cv2.inRange(frame, np.array([240, 240, 240]), np.array([255, 255, 255]))
+        
+        # Apply ROI - focus on bottom half where crosswalks appear
+        white_mask[:height//2, :] = 0
+        
+        # Check for horizontal lines
+        if self.detect_horizontal_lines(white_mask):
+            confidence = 0.9
+            
+            if self.show_visualization:
+                vis_frame = frame.copy()
+                cv2.putText(vis_frame, f"Crosswalk (H-Lines): {confidence:.2f}", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                           0.7, (0, 255, 0), 2)
+                cv2.rectangle(vis_frame, (96, 160), (160, 180), (0, 255, 0), 2)
+                cv2.imshow("Crosswalk Detection", vis_frame)
+            
+            return True, confidence
+        
+        # Fallback: Traditional line pattern detection
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         
-        # Apply adaptive thresholding to get white regions
+        # Apply adaptive thresholding
         thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                       cv2.THRESH_BINARY, 11, 2)
         
-        # Edge detection
-        edges = cv2.Canny(thresh, 50, 150)
+        # Focus on bottom half
+        roi = thresh[height//2:, :]
         
-        # Detect lines using Hough transform
+        # Edge detection
+        edges = cv2.Canny(roi, 50, 150)
+        
+        # Detect lines
         lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50,
                                minLineLength=width//8, maxLineGap=30)
         
@@ -99,49 +134,31 @@ class CrosswalkDetector:
         for line in lines:
             x1, y1, x2, y2 = line[0]
             
-            # Calculate angle of line
+            # Calculate angle
             angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
             
-            # Check if line is horizontal (within 15 degrees of horizontal)
+            # Check if line is horizontal
             if angle < 15 or angle > 165:
                 line_length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-                if line_length > width // 6:  # Filter short lines
+                if line_length > width // 6:
                     horizontal_lines.append(line[0])
         
-        # Check for crosswalk pattern (multiple parallel horizontal lines)
+        # Check for multiple parallel horizontal lines (crosswalk pattern)
         if len(horizontal_lines) >= 3:
-            # Sort lines by y-coordinate
-            horizontal_lines.sort(key=lambda l: (l[1] + l[3]) / 2)
+            confidence = min(1.0, len(horizontal_lines) / 5.0)
             
-            # Check for consistent spacing
-            if len(horizontal_lines) >= 3:
-                spacings = []
-                for i in range(len(horizontal_lines) - 1):
-                    y1 = (horizontal_lines[i][1] + horizontal_lines[i][3]) / 2
-                    y2 = (horizontal_lines[i+1][1] + horizontal_lines[i+1][3]) / 2
-                    spacings.append(abs(y2 - y1))
-                
-                # Check if spacings are consistent (crosswalk pattern)
-                if spacings:
-                    avg_spacing = np.mean(spacings)
-                    std_spacing = np.std(spacings)
-                    
-                    # Low standard deviation means consistent spacing
-                    if avg_spacing > 0 and (std_spacing / avg_spacing) < 0.5:
-                        confidence = min(1.0, len(horizontal_lines) / 5.0)
-                        
-                        if self.show_visualization:
-                            vis_frame = frame.copy()
-                            for line in horizontal_lines:
-                                x1, y1, x2, y2 = line
-                                cv2.line(vis_frame, (x1, y1 + height//2), 
-                                        (x2, y2 + height//2), (0, 255, 0), 2)
-                            cv2.putText(vis_frame, f"Crosswalk: {confidence:.2f}", 
-                                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                                       0.7, (0, 255, 0), 2)
-                            cv2.imshow("Crosswalk Detection", vis_frame)
-                        
-                        return True, confidence
+            if self.show_visualization:
+                vis_frame = frame.copy()
+                for line in horizontal_lines:
+                    x1, y1, x2, y2 = line
+                    cv2.line(vis_frame, (x1, y1 + height//2), 
+                            (x2, y2 + height//2), (0, 255, 0), 2)
+                cv2.putText(vis_frame, f"Crosswalk: {confidence:.2f}", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                           0.7, (0, 255, 0), 2)
+                cv2.imshow("Crosswalk Detection", vis_frame)
+            
+            return True, confidence
         
         return False, 0.0
     
@@ -184,18 +201,23 @@ class CrosswalkDetector:
         return detected, max_confidence
     
     def detect(self, frame):
-        """
-        Main detection method
-        Returns: (is_crosswalk, confidence)
-        """
+        """Main detection method - combines YOLO and horizontal line detection"""
         if frame is None or frame.size == 0:
             return False, 0.0
         
-        # Use appropriate detection method
+        # Try both methods
+        detected_yolo = False
+        confidence_yolo = 0.0
+        
         if self.use_yolo:
-            detected, confidence = self.detect_yolo(frame)
-        else:
-            detected, confidence = self.detect_classical(frame)
+            detected_yolo, confidence_yolo = self.detect_yolo(frame)
+        
+        # Always check for horizontal lines as well
+        detected_classical, confidence_classical = self.detect_classical_enhanced(frame)
+        
+        # Combine results - if either method detects, consider it detected
+        detected = detected_yolo or detected_classical
+        confidence = max(confidence_yolo, confidence_classical)
         
         # Add to history for stability
         self.detection_history.append(detected)
