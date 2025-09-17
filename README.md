@@ -104,24 +104,7 @@ TURN_DURATION = 5.0     # Turn maneuver duration
 5. **Perspective Transform**: Warped view for accurate lane positioning
 6. **Exponential Smoothing**: Stable steering output
 
-### Obstacle Avoidance Strategy
-- **Detection**: YOLOv11 segmentation at 640×640 resolution
-- **Decision**: Lane switching based on sensor data and free space
-- **Execution**: Smooth steering transitions with speed adaptation
-- **Recovery**: Return to original lane after obstacle clearance
 
-### Traffic Sign Recognition Flow
-1. **Detection**: ONNX model inference at 384×384 resolution
-2. **Classification**: 5-class detection with confidence scoring
-3. **State Management**: Finite state machine for traffic scenarios
-4. **Action Execution**: Controlled maneuvers based on sign type
-
-## Performance
-
-### System Requirements
-- **Minimum**: Intel i5, 8GB RAM, GTX 1050
-- **Recommended**: Intel i7, 16GB RAM, RTX 2060
-- **Optimal**: Intel i9, 32GB RAM, RTX 3070+
 
 ### Benchmarks
 | Component | CPU (fps) | GPU (fps) | Latency (ms) |
