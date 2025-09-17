@@ -69,7 +69,7 @@ python run.py urban
 cd race_mode
 python race_main.py
 
-# Urban mode
+# Urban mode  
 cd urban_mode
 python urban_main.py
 ```
