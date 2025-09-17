@@ -2,433 +2,409 @@ import cv2 as cv
 import numpy as np
 import sys
 import os
-import time
-from enum import Enum
-from collections import deque
+from time import time
+import onnxruntime as ort
+from math import hypot
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from avisengine import avisengine
-from common.lane_detection import LaneDetector
-from common.obstacle_detection import ObstacleDetector
-from common.utils import translate, calculate_curve_speed
 from urban_config import *
-from crosswalk_detector import CrosswalkDetector
-from sign_detector import TrafficSignDetector
-from apriltag_detector import AprilTagDetector
 
-class UrbanState(Enum):
-    NORMAL_DRIVING = 1
-    APPROACHING_CROSSWALK = 2
-    WAITING_AT_CROSSWALK = 3
-    TURNING = 4
-    FOLLOWING_SIGN = 5
-    APRILTAG_ACTION = 6
+# ------------------ Settings ------------------
+classes = ['Proceed Forward', 'Proceed Left', 'Proceed Right', 'Stop', 'traffic light']
+obstacle_classes = ["obstacle", "stop line"]  # Model classes but we'll filter out stop lines
+NUM_CLASSES = len(classes)
+CONF_THRES = 0.5
+NMS_THRES = 0.6
+W, H = 512, 512
+CAR_CENTER = (260, 400)
+top_left = (160, 230)
+top_right = (352, 230)
+bottom_right = (W - 30, H - 120)
+bottom_left = (60, H - 120)
+CONTOUR_MIN_SIZE = 250
+APPROX_MAX_SIZE = 16
+LOWER = np.array([0, 11, 148])
+UPPER = np.array([41, 19, 255])
+
+def warp_frame(frame):
+    """Convert main view to bird-eye view"""
+    src_points = np.float32([top_left, top_right, bottom_right, bottom_left])
+    dst_points = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
+    matrix = cv.getPerspectiveTransform(src_points, dst_points)
+    return cv.warpPerspective(frame, matrix, (W, H))
+
+def create_mask(frame, low, up):
+    """Create a color mask (HSV)"""
+    img_hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+    return cv.inRange(img_hsv, low, up)
+
+def find_line(frame, mask):
+    """Find the line center from contours"""
+    contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    line_center_x = None
+    line_img = np.zeros_like(frame)
+
+    if len(contours) > 0:
+        candidates = []
+        for c in contours:
+            if cv.contourArea(c) > CONTOUR_MIN_SIZE:
+                epsilon = 0.01 * cv.arcLength(c, True)
+                approx = cv.approxPolyDP(c, epsilon, True)
+                if len(approx) < APPROX_MAX_SIZE:
+                    M = cv.moments(c)
+                    if M["m00"] != 0:
+                        cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                        dist = hypot(cx - CAR_CENTER[0], cy - CAR_CENTER[1])
+                        candidates.append((c, (cx, cy), dist))
+        if candidates:
+            candidates.sort(key=lambda x: x[2])
+            best = candidates[0]
+            line_center_x = best[1][0]
+            cv.drawContours(line_img, [best[0]], -1, (0, 255, 0), -1)
+
+    return line_img, line_center_x
+
+def translate(value, leftMin, leftMax, rightMin, rightMax):
+    """Map a pixel range to a steering angle range"""
+    if leftMax == leftMin:
+        return rightMin
+    leftSpan = leftMax - leftMin
+    rightSpan = rightMax - rightMin
+    valueScaled = float(value - leftMin) / float(leftSpan)
+    return rightMin + (valueScaled * rightSpan)
+
+def calc_steering(frame, prev_avg=None, debug=False):
+    """Calculate lane center based on white line with memory of previous frame."""
+    warped_frame = warp_frame(frame)
+    white_mask = create_mask(warped_frame, LOWER, UPPER)
+    white_img, white_center_x = find_line(warped_frame, white_mask)
+
+    if white_center_x is not None:
+        target_x = white_center_x
+    else:
+        target_x = prev_avg if prev_avg is not None else CAR_CENTER[0]
+
+    if debug:
+        cv.imshow("warped", warped_frame)
+        cv.imshow("white mask", white_mask)
+
+    return white_img, target_x
+
+def sigmoid(x):
+    return 1/(1+np.exp(-x))
+
+def get_mask(mask_vec, box, orig_w, orig_h):
+    x1,y1,x2,y2 = box
+    mask = sigmoid(mask_vec.reshape(160,160))
+    mask = (mask>0.5).astype(np.uint8)*255
+    mx1,my1,mx2,my2 = map(int,[x1/orig_w*160,y1/orig_h*160,x2/orig_w*160,y2/orig_h*160])
+    mask = mask[my1:my2,mx1:mx2]
+    mask = cv.resize(mask,(int(x2-x1),int(y2-y1)), interpolation=cv.INTER_NEAREST)
+    return mask
+
+def iou(b1, b2):
+    x1, y1, x2, y2 = b1
+    X1, Y1, X2, Y2 = b2
+    inter = max(0, min(x2, X2) - max(x1, X1)) * max(0, min(y2, Y2) - max(y1, Y1))
+    area1, area2 = (x2-x1)*(y2-y1), (X2-X1)*(Y2-Y1)
+    return inter / (area1 + area2 - inter + 1e-6)
 
 class UrbanMode:
     def __init__(self, ip='127.0.0.3', port=25004):
         self.car = avisengine.Car()
         self.car.connect(ip, port)
-        
-        # Initialize detectors with enhanced settings
-        self.lane_detector = LaneDetector()
-        self.obstacle_detector = ObstacleDetector()
-        self.crosswalk_detector = CrosswalkDetector(use_yolo=True, show_visualization=True)
-        self.sign_detector = TrafficSignDetector(show_visualization=True)
-        self.apriltag_detector = AprilTagDetector(show_visualization=True)
-        
-        # Load or create car mask
-        self.car_mask = self.load_car_mask()
-        
-        # State management
-        self.current_speed = 30  # Slower for urban
-        self.previous_error = 0
-        self.state = UrbanState.NORMAL_DRIVING
-        self.state_timer = 0
-        self.turn_direction = 0
-        self.sign_state = 'nothing'
-        
-        # Control parameters
-        self.kp = 2
-        self.ki = 0.1
-        self.kd = 0.1
-        self.integral = 0
-        
-        # Detection history
-        self.sign_history = deque(maxlen=10)
-        self.apriltag_history = deque(maxlen=5)
-        
-        # Reference line position
-        self.REFERENCE = 128
-        
-        print("Enhanced Urban Mode initialized")
-    
-    def load_car_mask(self):
-        """Load or create car mask to filter out car body from detection"""
-        mask_path = os.path.join(os.path.dirname(__file__), 'car_mask.npy')
-        if os.path.exists(mask_path):
-            return np.load(mask_path)
-        else:
-            # Create default mask
-            mask = np.zeros((256, 256), dtype=np.uint8)
-            # Mark car body area (bottom center)
-            mask[200:256, 80:176] = 1
-            np.save(mask_path, mask)
-            print("Created default car mask")
-            return mask
-    
-    def detect_lines_urban(self, image):
-        """Detect lines using Hough transform"""
-        if image is None or not image.any():
+
+        # Load sign detection model
+        sign_model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                       'models', 'sign_detection.onnx')
+        try:
+            self.sign_model = ort.InferenceSession(sign_model_path)
+            print("Loaded sign detection model")
+        except:
+            print("Error: sign_detection.onnx not found")
+            self.sign_model = None
+            exit()
+
+        # Load obstacle detection model
+        obstacle_model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                           'models', 'obstacle_segmentation.onnx')
+        try:
+            self.obstacle_model = ort.InferenceSession(obstacle_model_path)
+            print("Loaded obstacle detection model")
+            self.has_obstacle_detection = True
+        except:
+            print("Warning: obstacle_segmentation.onnx not found - obstacle detection disabled")
+            self.obstacle_model = None
+            self.has_obstacle_detection = False
+
+        # Initialize variables - EXACT from working version
+        self.traffic_light_detected = False
+        self.start_time = 0
+        self.center_line_x = 0
+        self.steering = 0
+
+        # Direction flags - EXACT from working version
+        self.Proceed_Forward = False
+        self.Proceed_Left = False
+        self.Proceed_Right = False
+        self.Stop = False
+
+        # Smoother obstacle detection variables
+        self.obs = False
+        self.frame_count = 0
+        self.result = []
+
+    def detect_obstacles(self, frame):
+        """Detect obstacles only - ignore stop lines"""
+        if not self.has_obstacle_detection or self.obstacle_model is None:
             return []
-        
-        rho = 1
-        angle = np.pi / 180
-        min_threshold = 10
-        lines = cv.HoughLinesP(image, rho, angle, min_threshold, np.array([]), 
-                                minLineLength=8, maxLineGap=4)
-        return lines if lines is not None else []
-    
-    def mean_lines_urban(self, frame, lines):
-        """Calculate mean lines from detected lines"""
-        a = np.zeros_like(frame)
-        current_pix = 128
-        
-        if lines is None or len(lines) == 0:
-            return a, current_pix
-        
-        try:
-            left_line_x = []
-            left_line_y = []
-            right_line_x = []
-            right_line_y = []
-            
-            for line in lines:
-                for x1, y1, x2, y2 in line:
-                    if x2 - x1 == 0:
-                        continue
-                    slope = (y2 - y1) / (x2 - x1)
-                    if abs(slope) < 0.5:
-                        continue
-                    if slope <= 0:
-                        left_line_x.extend([x1, x2])
-                        left_line_y.extend([y1, y2])
-                    else:
-                        right_line_x.extend([x1, x2])
-                        right_line_y.extend([y1, y2])
-            
-            min_y = int(frame.shape[0] * 0.6)
-            max_y = int(frame.shape[0])
-            
-            left_x_end = 0
-            right_x_end = 256
-            
-            if left_line_y:
-                poly_left = np.poly1d(np.polyfit(left_line_y, left_line_x, deg=1))
-                left_x_start = int(poly_left(max_y))
-                left_x_end = int(poly_left(min_y))
-                cv.line(a, (left_x_start, max_y), (left_x_end, min_y), [255, 255, 0], 5)
-            
-            if right_line_y:
-                poly_right = np.poly1d(np.polyfit(right_line_y, right_line_x, deg=1))
-                right_x_start = int(poly_right(max_y))
-                right_x_end = int(poly_right(min_y))
-                cv.line(a, (right_x_start, max_y), (right_x_end, min_y), [255, 255, 0], 5)
-            
-            current_pix = (left_x_end + right_x_end) / 2
-            
-        except Exception as e:
-            current_pix = 128
-        
-        return a, current_pix
-    
-    def region_of_interest_urban(self, image):
-        """Apply region of interest mask"""
-        if len(image.shape) != 2:
-            return image
-        
-        height, width = image.shape
-        mask = np.zeros_like(image)
-        polygon = np.array([[
-            (0, height),
-            (0, 180),
-            (80, 130),
-            (256 - 80, 130),
-            (width, 180),
-            (width, height),
-        ]], np.int32)
-        
-        cv.fillPoly(mask, polygon, 255)
-        masked_image = image * mask
-        masked_image[:170, :] = 0
-        return masked_image
-    
-    def detect_horizontal_lines(self, mask):
-        """Detect horizontal lines (crosswalks)"""
-        roi = mask[160:180, 96:160]
-        try:
-            lines = self.detect_lines_urban(roi)
-            if not lines:
-                return False
-            
-            lines = np.array(lines).reshape(-1, 2, 2)
-            for line in lines:
-                if line[1, 0] != line[0, 0]:
-                    slope = abs((line[1, 1] - line[0, 1]) / (line[1, 0] - line[0, 0]))
-                    if slope < 0.2:
-                        return True
-            return False
-        except:
-            return False
-    
-    def detect_turn_direction(self, mask):
-        """Determine turn direction based on white lines"""
-        roi = mask[100:190, :]
-        lines = self.detect_lines_urban(roi)
-        
-        if not lines:
-            return 128
-        
-        try:
-            lines = np.array(lines).reshape(-1, 2, 2)
-            horizontal_lines = []
-            
-            for line in lines:
-                if line[1, 0] != line[0, 0]:
-                    slope = abs((line[1, 1] - line[0, 1]) / (line[1, 0] - line[0, 0]))
-                    if slope < 0.2:
-                        horizontal_lines.append(line)
-            
-            if horizontal_lines:
-                mean_x = np.mean([line[:, :, 0] for line in horizontal_lines])
-                return mean_x
-        except:
-            pass
-        
-        return 128
-    
-    def detect_side_position(self, side_mask):
-        """Detect side position"""
-        side_pix = np.mean(np.where(side_mask[150:190, :] > 0), axis=1)
-        if len(side_pix) > 1:
-            return side_pix[1]
-        return 128
-    
-    def detect_red_sign(self, red_mask):
-        """Detect red stop sign"""
-        contours, _ = cv.findContours(red_mask, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
-        if contours:
-            sorted_contours = sorted(contours, key=cv.contourArea, reverse=True)
-            if sorted_contours and cv.contourArea(sorted_contours[0]) > 50:
-                print('Red sign detected!')
-                return True
-        return False
-    
-    def stop_car_safely(self):
-        """Safely stop the car"""
-        self.car.setSteering(0)
-        while self.car.getSpeed() > 0:
-            self.car.setSpeed(-100)
-            self.car.getData()
-        self.car.setSpeed(0)
-    
-    def execute_turn(self, steering, duration):
-        """Execute turn maneuver"""
-        start_time = time.time()
-        while (time.time() - start_time) < duration:
-            self.car.getData()
-            self.car.setSteering(steering)
-            self.car.setSpeed(15)
-    
-    def reverse_car(self, duration):
-        """Reverse the car"""
-        start_time = time.time()
-        while (time.time() - start_time) < duration:
-            self.car.getData()
-            self.car.setSpeed(-15)
-        self.car.setSpeed(0)
-    
-    def run(self):
-        """Main urban mode loop with enhancements"""
-        print("Starting Enhanced Urban Mode...")
-        print("Press ESC to exit")
-        
-        # Initialize car
-        for _ in range(10):
-            self.car.setSteering(0)
-            self.car.setSpeed(10)
-            self.car.getData()
-        
-        while True:
+
+        # Model Inference - run every 4 frames
+        run_model = (self.frame_count % 4 == 0)
+        if run_model:
+            self.result = []
+            inp = cv.resize(frame, (640, 640)).astype(np.float32)/255.0
+            inp = np.transpose(inp, (2,0,1))[None]
+
             try:
-                # Get data from simulator
-                self.car.getData()
-                sensors = self.car.getSensors()
-                frame = self.car.getImage()
-                
-                if frame is not None:
-                    # Process frame with enhanced detection
-                    steering, speed = self.process_urban_frame(frame, sensors)
-                    
-                    # Apply controls
-                    self.car.setSteering(int(steering))
-                    self.car.setSpeed(int(speed))
-                    
-                    if cv.waitKey(1) & 0xFF == 27:  # ESC to exit
-                        break
-                        
-            except Exception as e:
-                print(f"Error in urban loop: {e}")
+                out0, out1 = self.obstacle_model.run(None, {"images": inp})
+                out0, out1 = out0[0].T, out1[0].reshape(32,-1)
+                boxes, mask_coef = out0[:,:6], out0[:,6:]
+                masks = mask_coef @ out1
+                orig_h, orig_w = frame.shape[:2]
+
+                for row, maskv in zip(boxes, masks):
+                    prob = row[4:6].max()
+                    if prob < 0.4: continue
+                    xc, yc, w, h = row[:4]
+                    cid = row[4:6].argmax()
+                    x1, y1 = (xc-w/2)/640*orig_w, (yc-h/2)/640*orig_h
+                    x2, y2 = (xc+w/2)/640*orig_w, (yc+h/2)/640*orig_h
+                    mask_img = get_mask(maskv, (x1,y1,x2,y2), orig_w, orig_h)
+
+                    # ONLY ADD OBSTACLES - IGNORE STOP LINES COMPLETELY
+                    if obstacle_classes[cid] == "obstacle":
+                        self.result.append([x1, y1, x2, y2, obstacle_classes[cid], prob, mask_img])
+
+                # NMS
+                self.result.sort(key=lambda x: x[5], reverse=True)
+                final_result = []
+                while self.result:
+                    best = self.result.pop(0)
+                    final_result.append(best)
+                    self.result = [o for o in self.result if iou(o[:4], best[:4]) < 0.7]
+                self.result = final_result
+            except:
+                pass
+
+        return self.result
+
+    def run(self):
+        """Main loop - proper sign action + smooth obstacle avoidance"""
+        print("Starting Urban Mode...")
+
+        while True:
+            self.car.getData()
+            frame = self.car.getImage()
+            if frame is None:
                 continue
-        
+
+            # Lane Detection
+            lane_img, self.center_line_x = calc_steering(frame, prev_avg=self.center_line_x)
+
+            # Sign Detection - EXACT from working version
+            orig_h, orig_w = frame.shape[:2]
+            inp = cv.resize(frame, (384, 384)).astype(np.float32) / 255.0
+            inp = np.transpose(inp, (2, 0, 1))[None]
+
+            outputs = self.sign_model.run(None, {"images": inp})
+            out0 = outputs[0]
+            out0 = out0.squeeze(0)
+            out0 = out0.transpose(1, 0)
+
+            boxes = out0[:, :4]
+            scores = out0[:, 4:]
+
+            sign_detections = []
+            for i, box in enumerate(boxes):
+                probs = scores[i]
+                cid = probs.argmax()
+                conf = probs[cid]
+                if conf < CONF_THRES:
+                    continue
+
+                xc, yc, w, h = box
+                x1 = (xc - w/2) / 384 * orig_w
+                y1 = (yc - h/2) / 384 * orig_h
+                x2 = (xc + w/2) / 384 * orig_w
+                y2 = (yc + h/2) / 384 * orig_h
+
+                sign_detections.append([x1, y1, x2, y2, classes[cid], conf])
+
+            # NMS for signs
+            sign_detections.sort(key=lambda x: x[5], reverse=True)
+            final_signs = []
+            while sign_detections:
+                best = sign_detections.pop(0)
+                final_signs.append(best)
+                sign_detections = [d for d in sign_detections if iou(d[:4], best[:4]) < NMS_THRES]
+
+            # Obstacle Detection
+            obstacle_detections = self.detect_obstacles(frame)
+            self.frame_count += 1
+
+            # Control car - EXACT logic from working sign detection
+            avg = self.center_line_x // 2
+            traffic_light = False
+
+            # Check for traffic signs - EXACT from working version
+            if final_signs:
+                l_2 = final_signs[0][4]
+                s_2 = final_signs[0][5]
+
+                if l_2 == 'traffic light' and s_2 > 0.8 and final_signs[0][2] > 190 and final_signs[0][2] < 350:
+                    traffic_light = True
+                    print(l_2, s_2, final_signs[0][2])
+                elif l_2 == 'Proceed Forward' and s_2 > 0.8:
+                    self.Proceed_Forward = True
+                    print(l_2, s_2)
+                elif l_2 == 'Proceed Left' and s_2 > 0.8:
+                    self.Proceed_Left = True
+                    print(l_2, s_2)
+                elif l_2 == 'Proceed Right' and s_2 > 0.8:
+                    self.Proceed_Right = True
+                    print(l_2, s_2)
+                elif l_2 == 'Stop' and s_2 > 0.8:
+                    self.Stop = True
+                    print(l_2, s_2)
+
+            # Obstacle detection logic - smoother than race mode
+            if obstacle_detections:
+                l = obstacle_detections[0][4]
+                s = obstacle_detections[0][5]
+
+                if l == 'obstacle' and obstacle_detections[0][2] > 200:
+                    if not self.obs:
+                        self.obs = True
+                        self.obs_start_time = time()
+                        print(f"Obstacle detected: {l} {s:.2f}")
+            else:
+                # Reset obstacle state when no detections
+                if self.obs and hasattr(self, 'obs_start_time') and (time() - self.obs_start_time >= 3):
+                    self.obs = False
+                    delattr(self, 'obs_start_time')
+
+            # Traffic light handling - EXACT from working version
+            if traffic_light:
+                self.car.setSpeed(0)
+                if not self.traffic_light_detected:
+                    self.start_time = time()
+                    self.traffic_light_detected = True
+
+            # Traffic light sequence handling - EXACT from working version
+            if self.traffic_light_detected:
+                if time() - self.start_time > 3:  # Wait 3 seconds then follow sign
+                    if self.Proceed_Right:
+                        self.steering = translate(self.center_line_x, 0, 50, 0, 90)
+                        self.car.setSteering(int(self.steering))
+                        self.car.setSpeed(10)
+                    elif self.Proceed_Left:
+                        self.steering = translate(self.center_line_x, 0, 50, -90, 0)
+                        self.car.setSteering(int(self.steering))
+                        self.car.setSpeed(10)
+                    elif self.Proceed_Forward:
+                        self.steering = translate(avg, 90, 170, -15, 15)
+                        self.car.setSteering(int(self.steering))
+                        self.car.setSpeed(10)
+                    elif self.Stop:
+                        self.car.setSpeed(0)
+
+                # Reset after 20 seconds
+                if time() - self.start_time > 20:
+                    self.traffic_light_detected = False
+                    self.Proceed_Forward = False
+                    self.Proceed_Left = False
+                    self.Proceed_Right = False
+                    self.Stop = False
+
+            # Obstacle avoidance - smoother steering for urban environment
+            elif self.obs and hasattr(self, 'obs_start_time') and (time() - self.obs_start_time < 3):
+                # Smoother obstacle avoidance steering - gentler left turn
+                self.steering = translate(self.center_line_x, 200, 400, -40, 40)
+                self.car.setSteering(int(self.steering))
+                self.car.setSpeed(8)  # Slightly slower but not too slow
+
+            # Normal driving
+            else:
+                if not traffic_light:
+                    self.steering = translate(avg, 90, 170, -15, 15)
+                    self.car.setSteering(int(self.steering))
+                    self.car.setSpeed(10)
+
+            # Draw results
+            show_frame = frame.copy()
+
+            # Draw sign detections (green boxes)
+            for x1, y1, x2, y2, label, conf in final_signs:
+                cv.rectangle(show_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                cv.putText(show_frame, f"{label} {conf:.2f}", (int(x1), int(y1)-5),
+                          cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            # Draw obstacle detections (red boxes)
+            for x1, y1, x2, y2, label, prob, _ in obstacle_detections:
+                cv.rectangle(show_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0,0,255), 2)
+                cv.putText(show_frame, f"{label} {prob:.2f}", (int(x1), int(y1)-5),
+                          cv.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+            # Draw lane center point
+            cv.circle(show_frame, (self.center_line_x, 300), 5, (0,255,0), -1)
+
+            # Status information
+            cv.putText(show_frame, f"Steering: {int(self.steering)}", (10, 30),
+                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+            cv.putText(show_frame, f"Speed: {self.car.getSpeed()}", (10, 60),
+                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,255), 2)
+
+            # Show current state
+            state_text = ""
+            if self.traffic_light_detected:
+                state_text = "TRAFFIC LIGHT"
+                color = (0, 255, 0)
+            elif self.obs and hasattr(self, 'obs_start_time'):
+                state_text = "AVOIDING OBSTACLE"
+                color = (0, 0, 255)
+            else:
+                state_text = "NORMAL"
+                color = (255, 255, 255)
+
+            cv.putText(show_frame, f"State: {state_text}", (10, 90),
+                      cv.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            # Show next action
+            if self.Proceed_Forward or self.Proceed_Left or self.Proceed_Right or self.Stop:
+                next_action = ""
+                if self.Proceed_Forward:
+                    next_action = "FORWARD"
+                elif self.Proceed_Left:
+                    next_action = "LEFT"
+                elif self.Proceed_Right:
+                    next_action = "RIGHT"
+                elif self.Stop:
+                    next_action = "STOP"
+
+                cv.putText(show_frame, f"Next: {next_action}", (10, 120),
+                          cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+            cv.imshow("Urban Mode", show_frame)
+            cv.imshow("Lane Detection", lane_img)
+
+            if cv.waitKey(1) & 0xFF == 27:
+                break
+
         self.car.stop()
         cv.destroyAllWindows()
-        print("Urban Mode stopped")
-    
-    def process_urban_frame(self, frame, sensors):
-        """Process frame using enhanced urban detection"""
-        hsv_frame = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-        
-        # Apply car mask to remove car body from detection
-        mask_inv = 1 - self.car_mask
-        
-        # Detect white lines for lane following
-        white_mask = cv.inRange(frame, np.array([240, 240, 240]), 
-                                np.array([255, 255, 255])) * mask_inv
-        
-        # Detect side walls/barriers
-        side_mask = cv.inRange(frame, np.array([130, 0, 108]), 
-                              np.array([160, 160, 200])) * mask_inv
-        
-        # Detect red signs (stop signs)
-        red_mask = cv.inRange(hsv_frame, np.array([140, 70, 0]), 
-                             np.array([255, 255, 255])) * mask_inv
-        
-        # Detect lines
-        roi_mask = self.region_of_interest_urban(white_mask)
-        lines = self.detect_lines_urban(roi_mask)
-        two_line_mask, CURRENT_PXL = self.mean_lines_urban(white_mask, lines)
-        
-        # Check for horizontal line (crosswalk)
-        horiz_detected = self.detect_horizontal_lines(white_mask)
-        
-        # Detect traffic signs using existing detector
-        sign = self.sign_detector.detect(frame)
-        if sign is not None:
-            sign_action = self.sign_detector.get_sign_action(sign)
-            if sign_action == -1:
-                self.sign_state = 'left'
-            elif sign_action == 1:
-                self.sign_state = 'right'
-            elif sign == 3:  # Straight Ahead Only
-                self.sign_state = 'straight'
-        
-        # Check for red sign
-        red_sign = self.detect_red_sign(red_mask)
-        
-        # Calculate steering
-        error = self.REFERENCE - CURRENT_PXL
-        
-        # PID control
-        dt = 0.05
-        self.integral += error * dt
-        derivative = (error - self.previous_error) / dt
-        steer = -(self.kp * error + self.ki * self.integral + self.kd * derivative)
-        self.previous_error = error
-        
-        speed = self.current_speed
-        
-        # Handle crosswalk
-        if horiz_detected:
-            print("Crosswalk detected")
-            self.stop_car_safely()
-            time.sleep(3)
-            
-            if not red_sign:
-                mean_pix = self.detect_turn_direction(white_mask)
-                side_pix = self.detect_side_position(side_mask)
-                
-                if self.sign_state == 'left':
-                    steering = -45 if side_pix > 128 else -50
-                    duration = 13 if side_pix > 128 else 12
-                    self.execute_turn(steering, duration)
-                elif self.sign_state == 'straight':
-                    self.execute_turn(0, 11)
-                elif self.sign_state == 'right':
-                    steering = 65 if side_pix > 128 else 70
-                    duration = 9.5 if side_pix > 128 else 11
-                    self.execute_turn(steering, duration)
-                else:
-                    # Use mean pixel for turn decision
-                    if mean_pix < 128:
-                        if side_pix > 128:
-                            self.reverse_car(4.5)
-                            self.execute_turn(-100, 10)
-                        else:
-                            self.execute_turn(-80, 8)
-                    else:
-                        if side_pix < 128:
-                            self.reverse_car(8)
-                        else:
-                            self.reverse_car(4.5)
-                        self.execute_turn(100, 10)
-                
-                self.sign_state = 'nothing'
-            else:
-                print("Red sign detected - stopping")
-                return 0, 0
-        
-        # Handle obstacles
-        if sensors[1] < 700:
-            self.stop_car_safely()
-            side_pix = self.detect_side_position(side_mask)
-            print(f'Obstacle detected, side_pix: {side_pix}')
-            time.sleep(3)
-            
-            if side_pix > 128:
-                # Obstacle on right, go left
-                self.execute_turn(-100, 5.5)
-                self.execute_turn(100, 6.5)
-                self.execute_turn(-100, 2.5)
-            else:
-                # Obstacle on left, go right
-                self.execute_turn(100, 4)
-        
-        # Visualize
-        self.visualize_urban(frame, white_mask, two_line_mask, side_mask, steer, speed)
-        
-        return steer, speed
-    
-    def visualize_urban(self, frame, white_mask, two_line_mask, side_mask, steering, speed):
-        """Enhanced visualization for urban mode"""
-        # Create displays
-        roi_display = cv.cvtColor(self.region_of_interest_urban(white_mask) * 255, 
-                                  cv.COLOR_GRAY2BGR)
-        two_line_display = cv.cvtColor(two_line_mask, cv.COLOR_GRAY2BGR)
-        side_display = cv.cvtColor(side_mask, cv.COLOR_GRAY2BGR)
-        
-        # Add info to main frame
-        show_frame = frame.copy()
-        cv.putText(show_frame, f'Sign: {self.sign_state}', (10, 30),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv.putText(show_frame, f'Speed: {speed}', (10, 60),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv.putText(show_frame, f'Steering: {steering:.1f}', (10, 90),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv.putText(show_frame, f'State: {self.state.name}', (10, 120),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
-        
-        # Combine displays
-        top_row = np.concatenate([show_frame, roi_display], axis=0)
-        bottom_row = np.concatenate([two_line_display, side_display], axis=0)
-        result = np.concatenate([top_row, bottom_row], axis=1)
-        
-        # Resize for better visibility
-        scale = 0.5
-        height, width = result.shape[:2]
-        result = cv.resize(result, (int(width * scale), int(height * scale)))
-        
-        cv.imshow("Urban Perception", result)
 
 if __name__ == "__main__":
     urban = UrbanMode()

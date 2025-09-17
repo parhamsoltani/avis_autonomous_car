@@ -2,203 +2,302 @@ import cv2 as cv
 import numpy as np
 import sys
 import os
-import time
+from time import time
+import onnxruntime as ort
+from math import hypot
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from avisengine import avisengine
-from common.lane_detection import LaneDetector
-from common.obstacle_detection import ObstacleDetector
-from common.utils import translate, calculate_curve_speed
 from race_config import *
+
+# ------------------ Exact settings from ------------------
+W, H = 512, 512
+CAR_CENTER = (260, 400)
+top_left = (160, 230)
+top_right = (352, 230)
+bottom_right = (W - 30, H - 120)
+bottom_left = (60, H - 120)
+CONTOUR_MIN_SIZE = 250
+APPROX_MAX_SIZE = 16
+LOWER_YELLOW = np.array([22, 102, 122])
+UPPER_YELLOW = np.array([30, 255, 255])
+classes = ["obstacle", "stop line"]
+
+def warp_frame(frame):
+    """Convert main view to bird-eye view"""
+    src_points = np.float32([top_left, top_right, bottom_right, bottom_left])
+    dst_points = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
+    matrix = cv.getPerspectiveTransform(src_points, dst_points)
+    return cv.warpPerspective(frame, matrix, (W, H))
+
+def create_mask(frame, low, up):
+    """Create a color mask (HSV)"""
+    img_hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+    return cv.inRange(img_hsv, low, up)
+
+def find_line(frame, mask):
+    """Find the line center from contours"""
+    contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    line_center_x = None
+    line_img = np.zeros_like(frame)
+
+    if len(contours) > 0:
+        candidates = []
+        for c in contours:
+            if cv.contourArea(c) > CONTOUR_MIN_SIZE:
+                epsilon = 0.01 * cv.arcLength(c, True)
+                approx = cv.approxPolyDP(c, epsilon, True)
+                if len(approx) < APPROX_MAX_SIZE:
+                    M = cv.moments(c)
+                    if M["m00"] != 0:
+                        cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                        dist = hypot(cx - CAR_CENTER[0], cy - CAR_CENTER[1])
+                        candidates.append((c, (cx, cy), dist))
+        if candidates:
+            candidates.sort(key=lambda x: x[2])
+            best = candidates[0]
+            line_center_x = best[1][0]
+            cv.drawContours(line_img, [best[0]], -1, (0, 255, 0), -1)
+
+    return line_img, line_center_x
+
+def translate(value, leftMin, leftMax, rightMin, rightMax):
+    """Map a pixel range to a steering angle range"""
+    if leftMax == leftMin:
+        return rightMin
+    leftSpan = leftMax - leftMin
+    rightSpan = rightMax - rightMin
+    valueScaled = float(value - leftMin) / float(leftSpan)
+    return rightMin + (valueScaled * rightSpan)
+
+def calc_steering(frame, prev_avg=None, debug=False):
+    """Calculate lane center based on yellow line with memory of previous frame."""
+    warped_frame = warp_frame(frame)
+    yellow_mask = create_mask(warped_frame, LOWER_YELLOW, UPPER_YELLOW)
+    yellow_img, yellow_center_x = find_line(warped_frame, yellow_mask)
+
+    if yellow_center_x is not None:
+        target_x = yellow_center_x
+    else:
+        target_x = prev_avg if prev_avg is not None else CAR_CENTER[0]
+
+    if debug:
+        cv.imshow("warped", warped_frame)
+        cv.imshow("yellow mask", yellow_mask)
+
+    return yellow_img, target_x
+
+def sigmoid(x):
+    return 1/(1+np.exp(-x))
+
+def get_mask(mask_vec, box, orig_w, orig_h):
+    x1,y1,x2,y2 = box
+    mask = sigmoid(mask_vec.reshape(160,160))
+    mask = (mask>0.5).astype(np.uint8)*255
+    mx1,my1,mx2,my2 = map(int,[x1/orig_w*160,y1/orig_h*160,x2/orig_w*160,y2/orig_h*160])
+    mask = mask[my1:my2,mx1:mx2]
+    mask = cv.resize(mask,(int(x2-x1),int(y2-y1)), interpolation=cv.INTER_NEAREST)
+    return mask
+
+def iou(b1,b2):
+    x1,y1,x2,y2 = b1
+    X1,Y1,X2,Y2 = b2
+    inter = max(0,min(x2,X2)-max(x1,X1))*max(0,min(y2,Y2)-max(y1,Y1))
+    area1,area2 = (x2-x1)*(y2-y1),(X2-X1)*(Y2-Y1)
+    return inter/(area1+area2-inter+1e-6)
 
 class RaceMode:
     def __init__(self, ip='127.0.0.3', port=25004):
         self.car = avisengine.Car()
         self.car.connect(ip, port)
-        
-        self.lane_detector = LaneDetector()
-        self.obstacle_detector = ObstacleDetector()
-        
-        # Enhanced parameters from reference projects
-        self.current_speed = 90  # Increased base speed
-        self.previous_error = 0
-        
-        # Sensor smoothing
-        self.sensors_array = np.array([1500, 1500, 1500])
-        self.sensor_smooth_factor = 0.3
-        
-        # Steering smoothing
-        self.steer_array = np.array(0)
-        
-        # Position tracking
-        self.position = 'right'
-        self.obstacle_avoidance_timer = 0
-        
+        self.car.setSensorAngle(20)
+
+        # Load ONNX model
+        model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                  'models', 'obstacle_segmentation.onnx')
+        try:
+            self.model = ort.InferenceSession(model_path)
+            self.use_yolo = True
+            print("Loaded ONNX model for obstacle detection")
+        except:
+            self.model = None
+            self.use_yolo = False
+            print("Using sensor-based obstacle detection")
+
+        # Initialize variables
+        self.center_line_x = 0
+        self.obs = False
+        self.start_time = 0
+        self.frame_count = 0
+        self.result = []
+        self.steering = 0
+
     def run(self):
-        """Main race mode loop with enhancements"""
-        print("Starting Enhanced Race Mode...")
-        counter = 0
-        
+        """Main loop - exact implementation"""
+        print("Starting Race Mode...")
+
         while True:
-            try:
-                self.car.getData()
-                
-                if counter > 4:  # Wait for stable connection
-                    # Get and smooth sensor data
-                    sensors = self.car.getSensors()
-                    self.sensors_array = np.round(
-                        self.sensor_smooth_factor * np.array(sensors) + 
-                        (1 - self.sensor_smooth_factor) * self.sensors_array, 1
-                    )
-                    
-                    frame = self.car.getImage()
-                    
-                    if frame is not None:
-                        # Enhanced processing
-                        steering, speed = self.process_frame_enhanced(frame)
-                        
-                        # Apply controls
-                        self.car.setSteering(int(steering))
-                        self.car.setSpeed(int(speed))
-                        
-                        # Visualization
-                        self.visualize_enhanced(frame, steering, speed)
-                        
-                        if cv.waitKey(1) & 0xFF == 27:  # ESC to exit
-                            break
-                
-                counter += 1
-                        
-            except Exception as e:
-                print(f"Error in race loop: {e}")
-                continue
-        
+            self.car.getData()
+            self.car.setSpeed(speed)  # speed from config
+
+            if self.use_yolo:
+                self.run_with_yolo()
+            else:
+                self.run_with_sensors()
+
+            if cv.waitKey(1) & 0xFF == 27:  # ESC
+                break
+
         self.car.stop()
         cv.destroyAllWindows()
-    
-    def process_frame_enhanced(self, frame):
-        """Enhanced frame processing using techniques from reference projects"""
-        # Convert to HSV and apply median blur
-        hsv_frame = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-        hsv_frame = cv.medianBlur(hsv_frame, 7)
-        
-        # Enhanced lane detection using reference color ranges
-        lane_mask = cv.inRange(hsv_frame, np.array([100, 10, 25]), np.array([120, 50, 60]))
-        kernel = np.ones((2, 2), np.uint8)
-        lane_mask = cv.erode(lane_mask, kernel, iterations=2)
-        kernel = np.ones((3, 3), np.uint8)
-        lane_mask = cv.dilate(lane_mask, kernel, iterations=2)
-        
-        # Find lane contours in specific ROI
-        lane_contours, _ = cv.findContours(
-            lane_mask[130:200, :], cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE
-        )
-        sorted_lanes = sorted(lane_contours, key=cv.contourArea, reverse=True)
-        
-        # Extract lane centers
-        CURRENT_PXL = 128
-        SECOND_PXL = 128
-        
-        if len(sorted_lanes) > 0:
-            right_lane_mask = cv.drawContours(
-                np.zeros((70, 256)), sorted_lanes, 0, 255, -1
-            )
-            CURRENT_PXL = np.mean(np.where(right_lane_mask > 0), axis=1)[1]
-            CURRENT_PXL = np.nan_to_num(CURRENT_PXL, nan=128)
-            
-            if len(sorted_lanes) > 1:
-                left_lane_mask = cv.drawContours(
-                    np.zeros((70, 256)), sorted_lanes, 1, 255, -1
-                )
-                SECOND_PXL = np.mean(np.where(left_lane_mask > 0), axis=1)[1]
-                SECOND_PXL = np.nan_to_num(SECOND_PXL, nan=128)
-        
-        # Detect yellow line for position tracking
-        yellow_mask = cv.inRange(hsv_frame, np.array([28, 115, 154]), np.array([31, 180, 255]))
-        YELLOW_PXL = np.mean(np.where(yellow_mask[140:190, :] > 0), axis=1)[1]
-        YELLOW_PXL = np.nan_to_num(YELLOW_PXL, nan=128)
-        
-        self.position = 'left' if YELLOW_PXL > 128 else 'right'
-        
-        # Enhanced obstacle detection
-        obstacle_mask = cv.inRange(hsv_frame, np.array([95, 0, 95]), np.array([180, 20, 160]))
-        kernel = np.ones((2, 2), np.uint8)
-        obstacle_mask = cv.erode(obstacle_mask, kernel, iterations=1)
-        kernel = np.ones((3, 3), np.uint8)
-        obstacle_mask = cv.dilate(obstacle_mask, kernel, iterations=1)
-        
-        # Find obstacle position
-        obs_yellow = np.mean(np.where(yellow_mask[65:170, :] > 0), axis=1)[1]
-        obs_yellow = np.nan_to_num(obs_yellow, nan=128)
-        
-        mean_obstacle = 0
-        obstacle_points, _ = cv.findContours(
-            obstacle_mask[50:200, :], cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE
-        )
-        if obstacle_points:
-            sorted_obs = sorted(obstacle_points, key=cv.contourArea, reverse=True)
-            if len(sorted_obs) > 0 and cv.contourArea(sorted_obs[0]) > 10:
-                x, y, w, h = cv.boundingRect(sorted_obs[0])
-                mean_obstacle = x + w // 2
-                # Draw obstacle box
-                cv.rectangle(frame, (x, y+50), (x+w, y+h+50), (0, 0, 255), 2)
-        
-        # Calculate steering with obstacle avoidance
-        REFERENCE = 128
-        kp = 2.2
-        
-        if self.position == 'left':
-            if (self.sensors_array[0] < 1450 or self.sensors_array[1] < 1450) and (mean_obstacle < obs_yellow):
-                error = REFERENCE - SECOND_PXL
-                self.obstacle_avoidance_timer = time.time()
-                steer = -(kp * error)
-            elif (time.time() - self.obstacle_avoidance_timer) > 0.8 and min(self.sensors_array) > 1450:
-                error = REFERENCE - SECOND_PXL
-                steer = -(kp * error)
-            else:
-                error = REFERENCE - CURRENT_PXL
-                steer = -(kp * error)
+
+    def run_with_sensors(self):
+        """Sensor-only mode - exact from reference obstacle_detection_with_sensor.py"""
+        sensors = self.car.getSensors()
+        frame = self.car.getImage()
+
+        if frame is None:
+            return
+
+        # Calculate lane center
+        lane_img, self.center_line_x = calc_steering(frame, prev_avg=self.center_line_x, debug=False)
+
+        # Speed control based on steering
+        if abs(self.car.steering_value) < 10:
+            self.car.setSpeed(speed)
         else:
-            if (self.sensors_array[2] < 1450 or self.sensors_array[1] < 1450) and (mean_obstacle > obs_yellow):
-                error = REFERENCE - SECOND_PXL
-                self.obstacle_avoidance_timer = time.time()
-                steer = -(kp * error)
-            else:
-                error = REFERENCE - CURRENT_PXL
-                steer = -(kp * error)
-        
-        # Smooth steering
-        self.steer_array = np.round(0.85 * steer + 0.15 * self.steer_array, 1)
-        
-        # Dynamic speed control
-        speed = 90
-        if abs(self.steer_array) > 20:
-            speed = 70
-        elif abs(self.steer_array) > 30:
-            speed = 60
-        
-        return self.steer_array, speed
-    
-    def visualize_enhanced(self, frame, steering, speed):
-        """Enhanced visualization"""
+            self.car.setSpeed(7)
+
+        # Obstacle detection logic - EXACT from reference
+        if sensors[2] > 1100:
+            # No obstacle
+            self.steering = translate(self.center_line_x, 0, 171, -30, 30)
+            self.car.setSteering(int(self.steering))
+        else:
+            if self.obs == False:
+                self.obs = True
+                self.start_time = time()
+
+        if self.obs and (time() - self.start_time < 10):
+            self.steering = translate(self.center_line_x, 340, 400, -80, 80)
+            self.car.setSteering(int(self.steering))
+            if self.car.getSpeed() > 10:
+                self.car.setSpeed(7)
+        else:
+            self.obs = False
+
+        # Display
         show_frame = frame.copy()
-        
-        # Add position indicator
-        position_color = (0, 255, 0) if self.position == 'right' else (0, 255, 255)
-        cv.putText(show_frame, f'Position: {self.position}', (10, 30),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, position_color, 2)
-        cv.putText(show_frame, f'Speed: {speed}', (10, 60),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv.putText(show_frame, f'Steering: {steering:.1f}', (10, 90),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv.putText(show_frame, f'Sensors: {self.sensors_array.astype(int)}', (10, 120),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        # Draw ROI boxes
-        cv.rectangle(show_frame, (0, 50), (256, 100), (0, 255, 255), 1)
-        cv.rectangle(show_frame, (0, 130), (256, 200), (0, 255, 255), 1)
-        
-        cv.imshow('Enhanced Race View', show_frame)
+        cv.circle(show_frame, (self.center_line_x, 300), 5, (0, 255, 0), cv.FILLED)
+        cv.putText(show_frame, f"Steering: {int(self.steering)}",
+                  (10, 20), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv.putText(show_frame, f"Speed: {self.car.getSpeed()}",
+                  (10, 45), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+
+        cv.imshow("frame", show_frame)
+        cv.imshow("lane detection", lane_img)
+
+    def run_with_yolo(self):
+        """YOLO mode - exact from reference obstacle_detection_with_yolo.py"""
+        frame = self.car.getImage()
+        if frame is None:
+            return
+
+        # Lane Detection
+        lane_img, self.center_line_x = calc_steering(frame, prev_avg=self.center_line_x)
+
+        # Model Inference - run every 4 frames
+        run_model = (self.frame_count % 4 == 0)
+        if run_model:
+            self.result = []
+            inp = cv.resize(frame, (640, 640)).astype(np.float32)/255.0
+            inp = np.transpose(inp, (2,0,1))[None]
+
+            try:
+                out0, out1 = self.model.run(None, {"images": inp})
+                out0, out1 = out0[0].T, out1[0].reshape(32,-1)
+                boxes, mask_coef = out0[:,:6], out0[:,6:]
+                masks = mask_coef @ out1
+                orig_h, orig_w = frame.shape[:2]
+
+                for row, maskv in zip(boxes, masks):
+                    prob = row[4:6].max()
+                    if prob < 0.4: continue
+                    xc, yc, w, h = row[:4]
+                    cid = row[4:6].argmax()
+                    x1, y1 = (xc-w/2)/640*orig_w, (yc-h/2)/640*orig_h
+                    x2, y2 = (xc+w/2)/640*orig_w, (yc+h/2)/640*orig_h
+                    mask_img = get_mask(maskv, (x1,y1,x2,y2), orig_w, orig_h)
+                    self.result.append([x1, y1, x2, y2, classes[cid], prob, mask_img])
+
+                # NMS
+                self.result.sort(key=lambda x: x[5], reverse=True)
+                final_result = []
+                while self.result:
+                    best = self.result.pop(0)
+                    final_result.append(best)
+                    self.result = [o for o in self.result if iou(o[:4], best[:4]) < 0.7]
+                self.result = final_result
+            except:
+                pass
+
+        self.frame_count += 1
+
+        # Speed control
+        if abs(self.car.steering_value) < 10:
+            self.car.setSpeed(speed)
+        else:
+            self.car.setSpeed(7)
+
+        # Steering control - EXACT logic from reference
+        if self.result:
+            l = self.result[0][4]
+            s = self.result[0][5]
+
+            if l == 'obstacle' and self.result[0][2] > 200:
+                self.obs = True
+                print(l, s)
+            else:
+                self.obs = False
+
+        # CRITICAL FIX: The timing logic was wrong. In reference, it sets start_time when obs becomes True
+        if self.obs:
+            if not hasattr(self, 'obs_start_time'):
+                self.obs_start_time = time()
+        else:
+            self.steering = translate(self.center_line_x, 0, 171, -30, 30)
+            self.car.setSteering(int(self.steering))
+            if hasattr(self, 'obs_start_time'):
+                delattr(self, 'obs_start_time')
+
+        # Apply obstacle avoidance steering
+        if self.obs and hasattr(self, 'obs_start_time') and (time() - self.obs_start_time < 2):
+            self.steering = translate(self.center_line_x, 380, 450, -90, 90)
+            self.car.setSteering(int(self.steering))
+            if self.car.getSpeed() > 10:
+                self.car.setSpeed(7)
+        elif self.obs and hasattr(self, 'obs_start_time'):
+            self.obs = False
+            delattr(self, 'obs_start_time')
+
+        # Display
+        show_frame = frame.copy()
+
+        # Draw bounding boxes
+        for x1, y1, x2, y2, label, prob, _ in self.result:
+            cv.rectangle(show_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0,0,255), 2)
+            cv.putText(show_frame, f"{label} {prob:.2f}", (int(x1), int(y1)-5),
+                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+        cv.circle(show_frame, (self.center_line_x, 300), 5, (0,255,0), -1)
+        cv.putText(show_frame, f"Steering: {int(self.steering)}",
+                  (10,20), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+        cv.putText(show_frame, f"Speed: {self.car.getSpeed()}",
+                  (10,45), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,255), 2)
+
+        cv.imshow("Lane Detection", lane_img)
+        cv.imshow("Object Detection", show_frame)
 
 if __name__ == "__main__":
     race = RaceMode()
