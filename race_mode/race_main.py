@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from avisengine import avisengine
 from race_config import *
 
-# ------------------ Exact settings from ------------------
+
 W, H = 512, 512
 CAR_CENTER = (260, 400)
 top_left = (160, 230)
@@ -169,7 +169,7 @@ class RaceMode:
         else:
             self.car.setSpeed(7)
 
-        # Obstacle detection logic - EXACT from reference
+        # Obstacle detection logic
         if sensors[2] > 1100:
             # No obstacle
             self.steering = translate(self.center_line_x, 0, 171, -30, 30)
@@ -250,7 +250,7 @@ class RaceMode:
         else:
             self.car.setSpeed(7)
 
-        # Steering control - EXACT logic from reference
+        # Steering control\]
         if self.result:
             l = self.result[0][4]
             s = self.result[0][5]
@@ -261,7 +261,7 @@ class RaceMode:
             else:
                 self.obs = False
 
-        # CRITICAL FIX: The timing logic was wrong. In reference, it sets start_time when obs becomes True
+        # CRITICAL FIX: The timing logic was wrong
         if self.obs:
             if not hasattr(self, 'obs_start_time'):
                 self.obs_start_time = time()
