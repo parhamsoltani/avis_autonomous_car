@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from avisengine import avisengine
 from urban_config import *
 
-# ------------------ Settings ------------------
+
 classes = ['Proceed Forward', 'Proceed Left', 'Proceed Right', 'Stop', 'traffic light']
 obstacle_classes = ["obstacle", "stop line"]  # Model classes but we'll filter out stop lines
 NUM_CLASSES = len(classes)
@@ -139,13 +139,13 @@ class UrbanMode:
             self.obstacle_model = None
             self.has_obstacle_detection = False
 
-        # Initialize variables - EXACT from working version
+        # Initialize variables 
         self.traffic_light_detected = False
         self.start_time = 0
         self.center_line_x = 0
         self.steering = 0
 
-        # Direction flags - EXACT from working version
+        # Direction flags
         self.Proceed_Forward = False
         self.Proceed_Left = False
         self.Proceed_Right = False
@@ -214,7 +214,7 @@ class UrbanMode:
             # Lane Detection
             lane_img, self.center_line_x = calc_steering(frame, prev_avg=self.center_line_x)
 
-            # Sign Detection - EXACT from working version
+            # Sign Detection 
             orig_h, orig_w = frame.shape[:2]
             inp = cv.resize(frame, (384, 384)).astype(np.float32) / 255.0
             inp = np.transpose(inp, (2, 0, 1))[None]
@@ -255,11 +255,11 @@ class UrbanMode:
             obstacle_detections = self.detect_obstacles(frame)
             self.frame_count += 1
 
-            # Control car - EXACT logic from working sign detection
+            # Control car 
             avg = self.center_line_x // 2
             traffic_light = False
 
-            # Check for traffic signs - EXACT from working version
+            # Check for traffic signs 
             if final_signs:
                 l_2 = final_signs[0][4]
                 s_2 = final_signs[0][5]
@@ -296,14 +296,14 @@ class UrbanMode:
                     self.obs = False
                     delattr(self, 'obs_start_time')
 
-            # Traffic light handling - EXACT from working version
+            # Traffic light handling 
             if traffic_light:
                 self.car.setSpeed(0)
                 if not self.traffic_light_detected:
                     self.start_time = time()
                     self.traffic_light_detected = True
 
-            # Traffic light sequence handling - EXACT from working version
+            # Traffic light sequence handling 
             if self.traffic_light_detected:
                 if time() - self.start_time > 3:  # Wait 3 seconds then follow sign
                     if self.Proceed_Right:
